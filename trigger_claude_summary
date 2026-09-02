@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+
+import argparse
+import asyncio
+import json
+import os
+
+import httpx
+import triggerware as tw
+
+
+async def main(trigger_name: str) -> None:
+    triggerware_api_key = os.environ["TRIGGERWARE_API_KEY"]
+    anthropic = httpx.AsyncClient(
+        base_url="https://api.anthropic.com",
+        headers={
+            "anthropic-version": "2023-06-01",
+            "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+        },
+        timeout=60,
+    )
+    client = await tw.TriggerwareClient.connect_https(
+        api_key=triggerware_api_key,
+        base_url="https://api.triggerware.com",
+        timeout=360,
+    )
+
+    trigger = await client.get_hosted_trigger(trigger_name)
+
+    async def handle_delta(added: list, deleted: list) -> None:
+        response = await anthropic.post(
+            "/v1/messages",
+            json={
+                "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+                "max_tokens": 600,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Explain this newly changed data. The signature lists "
+                            "the columns in each added or deleted row, in order.\n"
+                            + json.dumps(
+                                {
+                                    "trigger": trigger.name,
+                                    "query": trigger.query,
+                                    "signature": trigger.signature,
+                                    "added": added,
+                                    "deleted": deleted,
+                                },
+                                default=str,
+                            )
+                        ),
+                    }
+                ],
+            },
+        )
+        response.raise_for_status()
+
+        message = response.json()
+        print(
+            "".join(
+                block["text"]
+                for block in message["content"]
+                if block["type"] == "text"
+            ),
+            flush=True,
+        )
+
+    try:
+        await client.subscribe_trigger(
+            trigger_name,
+            handle_delta,
+            poll_interval=0.5,
+            retry_interval=5,
+        )
+    finally:
+        await anthropic.aclose()
+        await client.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("trigger_name")
+    args = parser.parse_args()
+    asyncio.run(main(args.trigger_name))
